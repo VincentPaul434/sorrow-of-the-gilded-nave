@@ -1,8 +1,21 @@
 import Phaser from "phaser";
-import { createTextures, PALETTE } from "../game/textures.js";
+import { createTextures } from "../game/textures.js";
 
 const WORLD_WIDTH = 5400;
-const FLOOR_Y = 650;
+const WORLD_HEIGHT = 720;
+const BASE_FLOOR_TOP = 616;
+const CHECKPOINT_POSITION = { x: 3136, y: 360 };
+const PHASE_THREE = {
+  enterX: 3264,
+  cameraLeft: 2880,
+  exitX: 4144,
+};
+const APSE_GATE = {
+  x: 4064,
+  openY: 80,
+  closedY: 275,
+  triggerX: 4280,
+};
 
 export class NaveScene extends Phaser.Scene {
   constructor() {
@@ -21,15 +34,16 @@ export class NaveScene extends Phaser.Scene {
   create() {
     createTextures(this);
     this.createCharacterAnimations();
-    this.physics.world.setBounds(0, 0, WORLD_WIDTH, 720);
-    this.cameras.main.setBounds(0, 0, WORLD_WIDTH, 720);
+    this.physics.world.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+    this.cameras.main.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
     this.cameras.main.setBackgroundColor("#090807");
 
     this.gameState = {
       health: 5,
       maxHealth: 5,
       fervour: 0,
-      checkpointX: 150,
+      checkpoint: { x: 150, y: BASE_FLOOR_TOP },
+      relicActivated: false,
       bossAwake: false,
       bossDead: false,
       won: false,
@@ -43,6 +57,7 @@ export class NaveScene extends Phaser.Scene {
     this.invulnerableUntil = 0;
     this.nextStepAt = 0;
     this.touchState = { left: false, right: false, jump: false, attack: false };
+    this.cameraMode = "follow";
 
     this.drawCathedral();
     this.createLevel();
@@ -55,8 +70,14 @@ export class NaveScene extends Phaser.Scene {
 
     this.physics.add.collider(this.player, this.solids);
     this.physics.add.collider(this.enemies, this.solids);
+    this.physics.add.collider(this.player, this.gates);
+    this.physics.add.collider(this.enemies, this.gates);
     this.physics.add.collider(this.projectiles, this.solids, (projectile) => projectile.destroy());
-    this.physics.add.overlap(this.player, this.spikes, () => this.hurtPlayer(2, this.player.x > 0 ? -1 : 1));
+    this.physics.add.collider(this.projectiles, this.gates, (projectile) => projectile.destroy());
+    this.physics.add.overlap(this.player, this.spikes, (player, spike) => {
+      const direction = Math.sign(player.x - spike.x) || -1;
+      this.hurtPlayer(2, direction);
+    });
     this.physics.add.overlap(this.player, this.enemies, (player, enemy) => this.touchEnemy(enemy));
     this.physics.add.overlap(this.player, this.projectiles, (player, projectile) => this.hitByProjectile(projectile));
     this.physics.add.overlap(this.attackZone, this.enemies, (zone, enemy) => this.hitEnemy(enemy));
@@ -79,9 +100,8 @@ export class NaveScene extends Phaser.Scene {
     const base = this.add.graphics().setDepth(-40);
     base.fillStyle(0x070706, 1).fillRect(0, 0, WORLD_WIDTH, 720);
 
-    // Use the ornament-rich, character-free right side of the reference as a
-    // repeating architectural plate. Each plate is veiled and interrupted by
-    // nearer columns so repetition reads as a continuous cathedral nave.
+    // Use the character-free side of the concept only as a distant value plate.
+    // Heavy tinting and slower parallax prevent its ledges from reading as play.
     const crop = { x: 610, y: 0, width: 1062, height: 800 };
     const artScaleX = 1380 / crop.width;
     for (let panel = 0; panel < 5; panel += 1) {
@@ -89,19 +109,20 @@ export class NaveScene extends Phaser.Scene {
         .setOrigin(0, 0)
         .setCrop(crop.x, crop.y, crop.width, crop.height)
         .setScale(artScaleX, 720 / crop.height)
-        .setAlpha(panel % 2 === 0 ? 0.72 : 0.6)
-        .setTint(panel % 2 === 0 ? 0xc5bba7 : 0x9f9382)
+        .setAlpha(panel % 2 === 0 ? 0.3 : 0.22)
+        .setTint(panel % 2 === 0 ? 0x777067 : 0x5e5953)
         .setDepth(-36);
-      art.setScrollFactor(0.975, 1);
+      art.setScrollFactor(0.92, 1);
     }
 
     const veil = this.add.graphics().setDepth(-34);
-    veil.fillStyle(0x080706, 0.17).fillRect(0, 0, WORLD_WIDTH, 260);
-    veil.fillStyle(0x080706, 0.28).fillRect(0, 260, WORLD_WIDTH, 150);
-    veil.fillStyle(0x080706, 0.48).fillRect(0, 410, WORLD_WIDTH, 115);
-    veil.fillStyle(0x080706, 0.72).fillRect(0, 525, WORLD_WIDTH, 195);
+    veil.fillStyle(0x080706, 0.3).fillRect(0, 0, WORLD_WIDTH, 260);
+    veil.fillStyle(0x080706, 0.42).fillRect(0, 260, WORLD_WIDTH, 150);
+    veil.fillStyle(0x080706, 0.62).fillRect(0, 410, WORLD_WIDTH, 115);
+    veil.fillStyle(0x080706, 0.82).fillRect(0, 525, WORLD_WIDTH, 195);
+    veil.setScrollFactor(0.94, 1);
 
-    const architecture = this.add.graphics().setDepth(-20);
+    const architecture = this.add.graphics().setDepth(-20).setScrollFactor(0.965, 1);
     for (let x = 280; x < WORLD_WIDTH; x += 680) {
       architecture.fillStyle(0x0a0908, 0.95).fillRect(x - 40, 0, 116, 620);
       architecture.fillStyle(0x201d1a, 1).fillRect(x - 24, 38, 84, 570);
@@ -123,7 +144,7 @@ export class NaveScene extends Phaser.Scene {
 
     // Recessed devotional bays keep the lower gameplay plane detailed without
     // competing with silhouettes and hazards.
-    const bays = this.add.graphics().setDepth(-17);
+    const bays = this.add.graphics().setDepth(-17).setScrollFactor(0.955, 1);
     for (let x = 80; x < WORLD_WIDTH; x += 430) {
       bays.fillStyle(0x080706, 0.68).fillRoundedRect(x, 330, 250, 285, 80);
       bays.lineStyle(5, 0x302a25, 0.82).strokeRoundedRect(x, 330, 250, 285, 80);
@@ -145,117 +166,156 @@ export class NaveScene extends Phaser.Scene {
       const statue = this.add.image(x, 495, "weeping-statue")
         .setOrigin(0.5, 1)
         .setScale(index % 2 === 0 ? 1.15 : 1.32)
-        .setAlpha(0.65)
+        .setAlpha(0.38)
         .setTint(index % 2 === 0 ? 0xaaa49a : 0x7c7770)
-        .setDepth(-10);
+        .setDepth(-10)
+        .setScrollFactor(0.97, 1);
       if (index % 2) statue.setFlipX(true);
     });
 
-    const iron = this.add.graphics().setDepth(-8);
-    for (let x = 40; x < WORLD_WIDTH; x += 92) {
-      iron.lineStyle(4, 0x100e0d, 1).lineBetween(x, 540, x, 617);
-      iron.lineStyle(2, 0x77462b, 0.8).lineBetween(x + 2, 547, x + 2, 612);
-      iron.fillStyle(0x97703a, 0.8).fillTriangle(x - 3, 543, x + 7, 543, x + 2, 530);
-    }
-    iron.lineStyle(5, 0x0a0908, 1).lineBetween(0, 575, WORLD_WIDTH, 575);
-    iron.lineStyle(2, 0x6b4228, 0.8).lineBetween(0, 578, WORLD_WIDTH, 578);
+    [620, 2150, 4890].forEach((x, index) => {
+      this.add.tileSprite(x, 238 + index * 8, 360, 48, "background-railing")
+        .setAlpha(0.42)
+        .setTint(0x625a50)
+        .setDepth(-8)
+        .setScrollFactor(0.975, 1);
+    });
 
-    const chains = this.add.graphics().setDepth(-6);
+    const chains = this.add.graphics().setDepth(-6).setScrollFactor(0.95, 1);
     [520, 1710, 3100, 4260].forEach((x, index) => {
       const length = index % 2 === 0 ? 175 : 245;
       chains.lineStyle(3, 0x090807, 1).lineBetween(x, 0, x, length);
       chains.lineStyle(1, 0x80603a, 0.8).lineBetween(x + 2, 0, x + 2, length);
-      this.add.image(x, length + 18, "censer-1").setScale(0.75).setAlpha(0.8).setDepth(-5);
+      this.add.image(x, length + 12, "decorative-censer")
+        .setScale(0.78)
+        .setAlpha(0.55)
+        .setDepth(-5)
+        .setScrollFactor(0.95, 1);
     });
 
-    const shafts = this.add.graphics().setDepth(-4).setBlendMode(Phaser.BlendModes.ADD);
-    shafts.fillStyle(0xe3d0a0, 0.075).fillTriangle(820, 0, 960, 0, 1390, 650);
-    shafts.fillStyle(0xf0d89d, 0.055).fillTriangle(2670, 0, 2805, 0, 3260, 650);
-    shafts.fillStyle(0xf1d89d, 0.085).fillTriangle(4480, 0, 4620, 0, 5000, 650);
-    shafts.fillStyle(0xd8be82, 0.035).fillTriangle(4700, 0, 4780, 0, 5250, 650);
+    const shafts = this.add.graphics().setDepth(-4).setBlendMode(Phaser.BlendModes.ADD).setScrollFactor(0.98, 1);
+    shafts.fillStyle(0xe3d0a0, 0.045).fillTriangle(990, 0, 1080, 0, 1270, 500);
+    shafts.fillStyle(0xf0d89d, 0.06).fillTriangle(2960, 0, 3060, 0, 3220, 345);
+    shafts.fillStyle(0xf1d89d, 0.075).fillTriangle(4310, 0, 4410, 0, 4470, 285);
   }
 
   createLevel() {
     this.solids = this.physics.add.staticGroup();
     this.spikes = this.physics.add.staticGroup();
     this.gates = this.physics.add.staticGroup();
-    let platformIndex = 0;
+    this.levelSurfaces = [
+      // Phase 1 and the Phase 2 approach share one uninterrupted safety floor.
+      { start: 0, end: 1600, top: 616, phase: 1 },
+      // Phase 2: four supported 64 px steps, with no alternate lower route.
+      { start: 1600, end: 1920, top: 552, phase: 2 },
+      { start: 1920, end: 2240, top: 488, phase: 2 },
+      { start: 2240, end: 2560, top: 424, phase: 2 },
+      { start: 2560, end: 3456, top: 360, phase: 2 },
+      // Phase 3: one upward jump and one wide, forgiving downward landing.
+      { start: 3552, end: 3808, top: 296, phase: 3 },
+      { start: 3872, end: 4192, top: 360, phase: 3 },
+      // The boss floor is continuous and terminates in visible architecture.
+      { start: 4192, end: WORLD_WIDTH, top: 360, phase: 4 },
+    ];
 
-    const platform = (x, y, width, height = 32) => {
+    const supportedSurface = ({ start, end, top }) => {
+      const width = end - start;
+      const height = WORLD_HEIGHT - top;
+      const x = start + width / 2;
+      const y = top + height / 2;
+
       this.add.tileSprite(x, y, width, height, "stone").setDepth(1);
-      const ledge = this.add.rectangle(x, y - height / 2 + 2, width, 3, 0xc0b8a5, 0.58).setDepth(2);
-      this.add.rectangle(x, y - height / 2 + 6, width, 2, 0x151311, 0.9).setDepth(2);
-      if (platformIndex % 2 === 0 && width > 150) {
-        const stainWidth = Math.min(150, Math.round(width * 0.22));
-        const stainX = x + width * (platformIndex % 4 === 0 ? 0.24 : -0.23);
-        this.add.tileSprite(stainX, y - height / 2 + 14, stainWidth, 24, "wax-edge").setDepth(2).setAlpha(0.86);
-      }
-      platformIndex += 1;
+      this.add.rectangle(x, top + 2, width, 4, 0xc4bca8, 0.9).setDepth(2);
+      this.add.rectangle(x, top + 7, width, 3, 0x12110f, 0.95).setDepth(2);
+
       const body = this.solids.create(x, y, "white").setVisible(false);
       body.displayWidth = width;
       body.displayHeight = height;
       body.refreshBody();
-      return { body, ledge };
     };
 
-    platform(430, FLOOR_Y, 860, 68);
-    platform(1120, FLOOR_Y, 360, 68);
-    platform(1580, FLOOR_Y, 420, 68);
-    platform(2080, FLOOR_Y, 400, 68);
-    platform(2600, FLOOR_Y, 520, 68);
-    platform(3250, FLOOR_Y, 600, 68);
-    platform(3850, FLOOR_Y, 440, 68);
-    platform(4700, FLOOR_Y, 1200, 68);
+    this.levelSurfaces.forEach(supportedSurface);
 
-    platform(865, 530, 170, 28);
-    platform(1340, 485, 180, 28);
-    platform(1800, 510, 190, 28);
-    platform(2280, 455, 180, 28);
-    platform(2835, 515, 170, 28);
-    platform(3485, 470, 170, 28);
-    platform(3925, 505, 150, 28);
+    const pits = this.add.graphics().setDepth(0);
+    pits.fillStyle(0x030303, 0.97);
+    pits.fillRect(3456, 360, 96, WORLD_HEIGHT - 360);
+    pits.fillRect(3808, 296, 64, WORLD_HEIGHT - 296);
 
-    const addSpikes = (x, y, count) => {
+    const addSpikeBed = (start, end, baseY, count) => {
+      const width = end - start;
+      this.add.rectangle(start + width / 2, baseY - 3, width, 6, 0x4c281c, 1)
+        .setStrokeStyle(1, 0x8b5c2e, 0.8)
+        .setDepth(1);
+
       for (let i = 0; i < count; i += 1) {
-        const spike = this.spikes.create(x + i * 30, y, "spike");
-        spike.body.setSize(24, 24).setOffset(4, 20);
+        const spike = this.spikes.create(start + 16 + i * 32, baseY, "spike")
+          .setOrigin(0.5, 1)
+          .setDepth(3);
         spike.refreshBody();
-        spike.setDepth(2);
+        spike.body.setSize(24, 32).setOffset(4, 4);
       }
     };
-    addSpikes(878, 620, 5);
-    addSpikes(1295, 620, 7);
-    addSpikes(1805, 620, 4);
-    addSpikes(2290, 620, 6);
-    addSpikes(2925, 620, 5);
-    addSpikes(3580, 620, 5);
-    addSpikes(4070, 620, 5);
 
-    this.relic = this.physics.add.staticImage(2680, 568, "reliquary").setDepth(4);
-    this.relic.body.setSize(54, 88).setOffset(-1, -3);
+    addSpikeBed(3808, 3872, 360, 2);
 
-    this.bossGate = this.gates.create(4190, 525, "gate").setDepth(3).setVisible(false);
+    this.relic = this.physics.add.staticImage(CHECKPOINT_POSITION.x, CHECKPOINT_POSITION.y, "reliquary")
+      .setOrigin(0.5, 1)
+      .setDepth(4);
+    this.relic.refreshBody();
+    this.relic.body.setSize(44, 72).setOffset(4, 8);
+
+    const apse = this.add.graphics().setDepth(0);
+    apse.fillStyle(0x060504, 0.96).fillRoundedRect(APSE_GATE.x - 82, 18, 164, 342, 72);
+    apse.lineStyle(7, 0x2f251c, 1).strokeRoundedRect(APSE_GATE.x - 82, 18, 164, 342, 72);
+    apse.lineStyle(2, 0x8b6228, 0.86).strokeRoundedRect(APSE_GATE.x - 70, 30, 140, 318, 62);
+    apse.lineStyle(1, 0xc0923f, 0.5).strokeRoundedRect(APSE_GATE.x - 62, 38, 124, 302, 56);
+    this.apseLight = this.add.rectangle(APSE_GATE.x, 190, 10, 316, 0xe0d4b8, 0.24)
+      .setBlendMode(Phaser.BlendModes.ADD)
+      .setDepth(0);
+    this.tweens.add({ targets: this.apseLight, alpha: 0.12, duration: 900, yoyo: true, repeat: -1 });
+
+    this.bossGate = this.gates.create(APSE_GATE.x, APSE_GATE.openY, "gate")
+      .setDepth(3)
+      .setVisible(true);
     this.bossGate.body.enable = false;
 
-    [90, 220, 505, 735, 1080, 1600, 2110, 2480, 2740, 3290, 3870, 4510, 4930, 5190].forEach((x, bank) => {
-      const count = bank % 3 === 0 ? 5 : 3;
+    const entranceWallWidth = 64;
+    const entranceWallHeight = BASE_FLOOR_TOP;
+    this.add.tileSprite(entranceWallWidth / 2, entranceWallHeight / 2, entranceWallWidth, entranceWallHeight, "stone").setDepth(1);
+    this.add.rectangle(entranceWallWidth - 2, entranceWallHeight / 2, 4, entranceWallHeight, 0xa7a398, 0.5).setDepth(2);
+    const entranceBody = this.solids.create(entranceWallWidth / 2, entranceWallHeight / 2, "white").setVisible(false);
+    entranceBody.displayWidth = entranceWallWidth;
+    entranceBody.displayHeight = entranceWallHeight;
+    entranceBody.refreshBody();
+
+    const terminalWallWidth = 80;
+    const terminalWallHeight = 360;
+    const terminalWallX = WORLD_WIDTH - terminalWallWidth / 2;
+    this.add.tileSprite(terminalWallX, terminalWallHeight / 2, terminalWallWidth, terminalWallHeight, "stone").setDepth(1);
+    this.add.rectangle(terminalWallX - terminalWallWidth / 2 + 2, terminalWallHeight / 2, 4, terminalWallHeight, 0xa7a398, 0.62).setDepth(2);
+    const terminalBody = this.solids.create(terminalWallX, terminalWallHeight / 2, "white").setVisible(false);
+    terminalBody.displayWidth = terminalWallWidth;
+    terminalBody.displayHeight = terminalWallHeight;
+    terminalBody.refreshBody();
+
+    const candleBank = (x, surfaceY, count, seed) => {
       for (let i = 0; i < count; i += 1) {
         const candleX = x + i * 8;
-        const candleHeight = 9 + ((bank * 7 + i * 11) % 18);
-        const candle = this.add.rectangle(candleX, 615 - candleHeight / 2, 3, candleHeight, 0xcabc98, 0.72).setDepth(3);
-        this.add.rectangle(candleX + 1, candle.y - 1, 1, candleHeight - 3, 0x746c5f, 0.72).setDepth(3);
-        const flame = this.add.rectangle(candleX, candle.y - candle.height / 2 - 4, 2, 5, 0xe7ae4b, 0.82).setDepth(3);
-        this.tweens.add({ targets: flame, alpha: 0.3, scaleY: 1.45, duration: 310 + ((bank * 43 + i * 61) % 290), yoyo: true, repeat: -1 });
+        const candleHeight = 10 + ((seed * 7 + i * 11) % 14);
+        const candle = this.add.rectangle(candleX, surfaceY - candleHeight / 2, 3, candleHeight, 0xbeb49d, 0.58).setDepth(0);
+        const flame = this.add.rectangle(candleX, candle.y - candle.height / 2 - 4, 2, 5, 0xd39b40, 0.7).setDepth(0);
+        this.tweens.add({ targets: flame, alpha: 0.25, scaleY: 1.35, duration: 420 + i * 70, yoyo: true, repeat: -1 });
       }
-    });
+    };
 
-    [420, 1670, 2550, 3380, 4740].forEach((x, index) => {
-      this.add.tileSprite(x, 586, index === 4 ? 260 : 190, 58, "iron-fence").setDepth(0).setAlpha(0.9);
-    });
+    candleBank(300, 616, 3, 1);
+    candleBank(1110, 616, 3, 2);
+    candleBank(3050, 360, 3, 3);
+    candleBank(5150, 360, 3, 5);
   }
 
   createPlayer() {
-    this.player = this.physics.add.sprite(150, 616, "penitent-idle-animation", 0)
+    this.player = this.physics.add.sprite(150, BASE_FLOOR_TOP, "penitent-idle-animation", 0)
       .setOrigin(0.5, 286 / 320)
       .setScale(0.43)
       .setDepth(6);
@@ -270,17 +330,12 @@ export class NaveScene extends Phaser.Scene {
     this.attackZone.body.allowGravity = false;
     this.attackZone.body.enable = false;
 
-    this.playerShadow = this.add.ellipse(this.player.x, FLOOR_Y - 33, 46, 9, 0x000000, 0.58).setDepth(4);
+    this.playerShadow = this.add.ellipse(this.player.x, BASE_FLOOR_TOP + 2, 46, 9, 0x000000, 0.58).setDepth(4);
   }
 
   createEnemies() {
     this.enemies = this.physics.add.group({ allowGravity: true });
     this.projectiles = this.physics.add.group({ allowGravity: false });
-    this.spawnEnemy("mourner", 640, 616, 3, 520, 760);
-    this.spawnEnemy("censer", 1460, 420, 2, 1330, 1690);
-    this.spawnEnemy("mourner", 1950, 616, 3, 1850, 2190);
-    this.spawnEnemy("censer", 3020, 470, 2, 2880, 3400);
-    this.spawnEnemy("mourner", 3660, 616, 4, 3500, 3980);
   }
 
   spawnEnemy(kind, x, y, hp, minX, maxX) {
@@ -291,7 +346,7 @@ export class NaveScene extends Phaser.Scene {
     enemy.minX = minX;
     enemy.maxX = maxX;
     enemy.direction = -1;
-    enemy.nextAttackAt = Phaser.Math.Between(600, 1500);
+    enemy.nextAttackAt = this.time.now + Phaser.Math.Between(600, 1500);
     enemy.lastHitSerial = -1;
     enemy.setBounce(0);
     if (kind === "censer") {
@@ -405,8 +460,9 @@ export class NaveScene extends Phaser.Scene {
     }).setDepth(-5);
 
     const foregroundHaze = this.add.graphics().setScrollFactor(0).setDepth(30);
-    foregroundHaze.fillStyle(0x090807, 0.14).fillRect(0, 610, 1280, 110);
-    foregroundHaze.fillStyle(0x5b3b21, 0.025).fillRect(0, 0, 1280, 720);
+    foregroundHaze.fillStyle(0x090807, 0.08).fillRect(0, 0, 1280, 44);
+    foregroundHaze.fillStyle(0x090807, 0.08).fillRect(0, 0, 18, 720);
+    foregroundHaze.fillRect(1262, 0, 18, 720);
 
     const vignette = this.add.graphics().setScrollFactor(0).setDepth(35);
     vignette.fillStyle(0x000000, 0.4).fillRect(0, 0, 1280, 26);
@@ -473,7 +529,11 @@ export class NaveScene extends Phaser.Scene {
   }
 
   update(time) {
-    if (!this.player?.active || this.gameState.won) return;
+    if (!this.player?.active) return;
+    if (this.gameState.won) {
+      if (Phaser.Input.Keyboard.JustDown(this.keys.restart)) this.scene.restart();
+      return;
+    }
     const left = this.keys.left.isDown || this.keys.leftAlt.isDown || this.touchState.left;
     const right = this.keys.right.isDown || this.keys.rightAlt.isDown || this.touchState.right;
     const jumpPressed = Phaser.Input.Keyboard.JustDown(this.keys.jump) || Phaser.Input.Keyboard.JustDown(this.keys.jumpAlt) || this.consumeTouch("jump");
@@ -504,16 +564,41 @@ export class NaveScene extends Phaser.Scene {
 
     if (attackPressed && time > this.attackingUntil && time > this.parryingUntil) this.attack(time);
     if (parryPressed && time > this.parryingUntil && time > this.attackingUntil) this.parry(time);
-    if (Phaser.Input.Keyboard.JustDown(this.keys.restart) && (this.gameState.health <= 0 || this.gameState.won)) this.scene.restart();
+    if (Phaser.Input.Keyboard.JustDown(this.keys.restart) && this.gameState.health <= 0) this.scene.restart();
 
     this.updatePlayerAnimation(time);
     this.updateAttackZone();
     this.updateEnemies(time);
+    this.updateTutorialCamera();
     this.checkBossTrigger();
 
-    this.playerShadow.setPosition(this.player.x, Math.min(FLOOR_Y - 34, this.player.y + 4));
-    this.playerShadow.setScale(Phaser.Math.Clamp(1 - Math.abs(this.player.y - 616) / 500, 0.4, 1), 1);
+    const grounded = this.player.body.blocked.down;
+    this.playerShadow.setVisible(grounded);
+    if (grounded) this.playerShadow.setPosition(this.player.x, this.player.y + 2).setScale(1, 1);
     if (this.player.y > 710) this.killPlayer();
+  }
+
+  updateTutorialCamera() {
+    const camera = this.cameras.main;
+
+    if (this.cameraMode === "follow" && this.player.x >= PHASE_THREE.enterX && !this.gameState.bossAwake) {
+      this.cameraMode = "phase-three";
+      camera.stopFollow();
+      camera.setScroll(PHASE_THREE.cameraLeft, 0);
+      return;
+    }
+
+    if (this.cameraMode === "phase-three" && this.player.x < PHASE_THREE.enterX - 96) {
+      this.cameraMode = "follow";
+      camera.startFollow(this.player, true, 0.09, 0.08, -220, 50);
+      camera.setDeadzone(170, 90);
+      return;
+    }
+
+    if (this.cameraMode === "phase-three" && this.player.x >= PHASE_THREE.exitX) {
+      this.cameraMode = "boss";
+      camera.pan(4740, 360, 520, "Sine.easeInOut", true);
+    }
   }
 
   consumeTouch(field) {
@@ -606,9 +691,12 @@ export class NaveScene extends Phaser.Scene {
 
   updateBoss(boss, time, distance) {
     if (!this.gameState.bossAwake) return;
+    if (boss.x < boss.minX) boss.body.reset(boss.minX, boss.y);
+    if (boss.x > boss.maxX) boss.body.reset(boss.maxX, boss.y);
     boss.setFlipX(distance < 0);
-    if (Math.abs(distance) > 130) boss.setVelocityX(Math.sign(distance) * 48);
-    else boss.setVelocityX(0);
+    let movement = Math.abs(distance) > 130 ? Math.sign(distance) * 48 : 0;
+    if ((movement < 0 && boss.x <= boss.minX) || (movement > 0 && boss.x >= boss.maxX)) movement = 0;
+    boss.setVelocityX(movement);
     if (time > boss.nextAttackAt) {
       const direction = distance > 0 ? 1 : -1;
       boss.anims.stop();
@@ -726,8 +814,34 @@ export class NaveScene extends Phaser.Scene {
     this.gameState.deaths += 1;
     this.gameState.health = this.gameState.maxHealth;
     this.gameState.fervour = Math.max(0, this.gameState.fervour - 25);
-    this.player.setPosition(this.gameState.checkpointX, 616).setAlpha(1).clearTint();
+    const checkpoint = this.gameState.checkpoint;
+    this.projectiles.clear(true, true);
     this.player.body.enable = true;
+    this.player.body.reset(checkpoint.x, checkpoint.y);
+    this.player.setAlpha(1).clearTint();
+    this.player.setAccelerationX(0).setVelocity(0, 0);
+    this.attackZone.body.enable = false;
+    this.jumpQueuedAt = -999;
+    this.lastGroundedAt = this.time.now;
+    this.attackingUntil = 0;
+    this.parryingUntil = 0;
+    this.invulnerableUntil = this.time.now + 1200;
+
+    if (this.gameState.bossAwake && this.boss?.active) {
+      this.boss.body.reset(4860, 360);
+      this.boss.setVelocity(0, 0).setAlpha(1).clearTint();
+      this.boss.attackingUntil = 0;
+      this.boss.nextAttackAt = this.time.now + 1400;
+      this.boss.play("bishop", true);
+      this.cameraMode = "boss";
+      this.cameras.main.stopFollow();
+      this.cameras.main.setScroll(4100, 0);
+    } else {
+      this.cameraMode = "follow";
+      this.cameras.main.startFollow(this.player, true, 0.09, 0.08, -220, 50);
+      this.cameras.main.setDeadzone(170, 90);
+    }
+
     this.dying = false;
     epitaph.destroy();
     this.cameras.main.fadeIn(500, 8, 5, 4);
@@ -735,26 +849,37 @@ export class NaveScene extends Phaser.Scene {
   }
 
   activateCheckpoint() {
-    if (this.gameState.checkpointX === 2680) return;
-    this.gameState.checkpointX = 2680;
+    if (this.gameState.relicActivated) return;
+    this.gameState.relicActivated = true;
+    this.gameState.checkpoint = { ...CHECKPOINT_POSITION };
     this.gameState.health = this.gameState.maxHealth;
+    this.relic.body.enable = false;
     this.relic.setTint(0xffd679);
     this.tweens.add({ targets: this.relic, y: this.relic.y - 6, duration: 700, yoyo: true, repeat: -1 });
     this.flash(0xd0a54e, 250);
     this.tone(420, 0.7, 0.18, "sine");
-    const text = this.add.text(2680, 485, "THE RELIQUARY REMEMBERS", { fontFamily: "Georgia", fontSize: "17px", color: "#d8c69f", stroke: "#080706", strokeThickness: 4 }).setOrigin(0.5).setDepth(10);
-    this.tweens.add({ targets: text, alpha: 0, y: 470, duration: 1600, delay: 800, onComplete: () => text.destroy() });
+    const text = this.add.text(CHECKPOINT_POSITION.x, 256, "THE RELIQUARY REMEMBERS", { fontFamily: "Georgia", fontSize: "17px", color: "#d8c69f", stroke: "#080706", strokeThickness: 4 }).setOrigin(0.5).setDepth(10);
+    this.tweens.add({ targets: text, alpha: 0, y: 240, duration: 1600, delay: 800, onComplete: () => text.destroy() });
     this.updateHud();
   }
 
   checkBossTrigger() {
-    if (this.gameState.bossAwake || this.player.x < 4330) return;
+    if (this.gameState.bossAwake || this.player.x < APSE_GATE.triggerX) return;
     this.gameState.bossAwake = true;
-    this.bossGate.setVisible(true);
-    this.bossGate.body.enable = true;
-    this.bossGate.refreshBody();
-    const boss = this.spawnEnemy("boss", 4850, 616, 14, 4350, 5150);
+    this.gameState.checkpoint = { x: 4260, y: 360 };
+    this.tweens.add({
+      targets: this.bossGate,
+      y: APSE_GATE.closedY,
+      duration: 520,
+      ease: "Sine.easeIn",
+      onComplete: () => {
+        this.bossGate.refreshBody();
+        this.bossGate.body.enable = true;
+      },
+    });
+    const boss = this.spawnEnemy("boss", 4860, 360, 14, 4500, 5260);
     boss.maxHp = 14;
+    boss.nextAttackAt = this.time.now + 1400;
     this.boss = boss;
     this.bossHud.setVisible(true).setAlpha(0);
     this.tweens.add({ targets: this.bossHud, alpha: 1, duration: 800 });
@@ -771,7 +896,7 @@ export class NaveScene extends Phaser.Scene {
     this.tone(110, 1.4, 0.25, "triangle");
     this.time.delayedCall(900, () => {
       this.bossGate.body.enable = false;
-      this.tweens.add({ targets: this.bossGate, y: 330, alpha: 0, duration: 900 });
+      this.tweens.add({ targets: this.bossGate, y: APSE_GATE.openY, alpha: 1, duration: 900 });
       this.tweens.add({ targets: this.bossHud, alpha: 0, duration: 500 });
       const ending = this.add.container(640, 270).setScrollFactor(0).setDepth(90).setAlpha(0);
       const veil = this.add.rectangle(0, 75, 620, 215, 0x090706, 0.86).setStrokeStyle(2, 0x9b6e2d, 0.75);

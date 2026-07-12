@@ -172,6 +172,28 @@ function censerFrame(scene, key, phase) {
   });
 }
 
+function decorativeCenser(scene) {
+  canvasTexture(scene, "decorative-censer", 32, 52, (ctx) => {
+    // A small, sealed votive vessel: static, symmetrical, and deliberately
+    // duller than the wide, swinging hostile censer silhouette.
+    rect(ctx, PALETTE.ink, 14, 0, 4, 23);
+    rect(ctx, PALETTE.stone1, 15, 0, 2, 22);
+    pixels(ctx, PALETTE.rust, [[12, 6, 3, 2], [17, 12, 3, 2], [12, 18, 3, 2]]);
+    rect(ctx, PALETTE.ink, 10, 21, 12, 4);
+    rect(ctx, PALETTE.stone2, 12, 22, 8, 2);
+    rect(ctx, PALETTE.ink, 7, 25, 18, 12);
+    rect(ctx, PALETTE.stone0, 9, 26, 14, 10);
+    rect(ctx, PALETTE.stone1, 11, 27, 10, 7);
+    rect(ctx, PALETTE.gold0, 13, 29, 6, 3);
+    pixels(ctx, PALETTE.rust, [[8, 28, 2, 2], [22, 28, 2, 2], [10, 35, 3, 2], [19, 35, 3, 2]]);
+    rect(ctx, PALETTE.ink, 10, 37, 12, 5);
+    rect(ctx, PALETTE.stone0, 12, 38, 8, 3);
+    rect(ctx, PALETTE.ink, 14, 42, 4, 7);
+    rect(ctx, PALETTE.rust, 15, 43, 2, 5);
+    rect(ctx, PALETTE.ink, 12, 49, 8, 3);
+  });
+}
+
 function bishopFrame(scene, key, phase) {
   canvasTexture(scene, key, 108, 132, (ctx) => {
     const bob = phase ? 2 : 0;
@@ -248,6 +270,24 @@ function environmentTextures(scene) {
     }
     rect(ctx, PALETTE.ink, 0, 32, 64, 5);
     rect(ctx, PALETTE.rust, 0, 33, 64, 2);
+  });
+
+  canvasTexture(scene, "background-railing", 64, 48, (ctx) => {
+    // Blunt stepped caps and low-value metal keep this readable as scenery,
+    // never as the pointed silhouette of the gameplay spike texture.
+    rect(ctx, PALETTE.ink, 0, 40, 64, 8);
+    rect(ctx, PALETTE.stone0, 0, 42, 64, 3);
+    for (let x = 3; x < 64; x += 12) {
+      rect(ctx, PALETTE.ink, x, 10, 7, 34);
+      rect(ctx, PALETTE.stone0, x + 2, 13, 3, 28);
+      rect(ctx, PALETTE.rust, x + 4, 16, 1, 21);
+      rect(ctx, PALETTE.ink, x - 2, 8, 11, 5);
+      rect(ctx, PALETTE.stone1, x, 9, 7, 2);
+      rect(ctx, PALETTE.ink, x, 5, 7, 4);
+      rect(ctx, PALETTE.stone0, x + 1, 6, 5, 2);
+    }
+    rect(ctx, PALETTE.ink, 0, 24, 64, 6);
+    rect(ctx, PALETTE.stone0, 0, 26, 64, 2);
   });
 
   canvasTexture(scene, "wax-edge", 64, 24, (ctx) => {
@@ -331,6 +371,7 @@ function environmentTextures(scene) {
 export function createTextures(scene) {
   censerFrame(scene, "censer-1", 0);
   censerFrame(scene, "censer-2", 1);
+  decorativeCenser(scene);
   environmentTextures(scene);
 
   scene.anims.create({ key: "censer", frames: [{ key: "censer-1" }, { key: "censer-2" }], frameRate: 2, repeat: -1 });
