@@ -1,4 +1,5 @@
 import Phaser from "phaser";
+import { NaveAudio } from "../game/audio.js";
 import { createTextures } from "../game/textures.js";
 
 const WORLD_WIDTH = 5400;
@@ -34,6 +35,9 @@ export class NaveScene extends Phaser.Scene {
   create() {
     createTextures(this);
     this.createCharacterAnimations();
+    this.audioDirector = new NaveAudio(this);
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.audioDirector?.stop());
+    if (this.sound.context?.state === "running") this.audioDirector.start();
     this.physics.world.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
     this.cameras.main.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
     this.cameras.main.setBackgroundColor("#090807");
@@ -493,39 +497,11 @@ export class NaveScene extends Phaser.Scene {
   }
 
   startAudio() {
-    if (this.audioStarted) return;
-    this.audioStarted = true;
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContext) return;
-    this.audioContext = new AudioContext();
-    const master = this.audioContext.createGain();
-    master.gain.value = 0.09;
-    master.connect(this.audioContext.destination);
-    this.audioMaster = master;
-    [55, 82.4, 110].forEach((frequency, index) => {
-      const oscillator = this.audioContext.createOscillator();
-      const gain = this.audioContext.createGain();
-      oscillator.type = index === 0 ? "sine" : "triangle";
-      oscillator.frequency.value = frequency;
-      gain.gain.value = index === 0 ? 0.15 : 0.035;
-      oscillator.connect(gain).connect(master);
-      oscillator.start();
-    });
+    this.audioDirector?.start();
   }
 
-  tone(frequency, duration = 0.08, volume = 0.2, type = "square") {
-    if (!this.audioContext || !this.audioMaster) return;
-    const now = this.audioContext.currentTime;
-    const oscillator = this.audioContext.createOscillator();
-    const gain = this.audioContext.createGain();
-    oscillator.type = type;
-    oscillator.frequency.setValueAtTime(frequency, now);
-    oscillator.frequency.exponentialRampToValueAtTime(Math.max(35, frequency * 0.7), now + duration);
-    gain.gain.setValueAtTime(volume, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
-    oscillator.connect(gain).connect(this.audioMaster);
-    oscillator.start(now);
-    oscillator.stop(now + duration);
+  tone(frequency, duration = 0.08, volume = 0.2, type = "sine") {
+    this.audioDirector?.tone(frequency, duration, volume, type);
   }
 
   update(time) {
@@ -635,13 +611,13 @@ export class NaveScene extends Phaser.Scene {
     this.time.delayedCall(240, () => { if (this.attackZone.body) this.attackZone.body.enable = true; });
     this.time.delayedCall(430, () => { if (this.attackZone.body) this.attackZone.body.enable = false; });
     this.cameras.main.shake(60, 0.0012);
-    this.tone(230, 0.09, 0.24, "sawtooth");
+    this.audioDirector?.slash(this.player.flipX ? -1 : 1, this.attackSerial);
   }
 
   parry(time) {
     this.parryingUntil = time + 360;
     this.player.setVelocityX(0);
-    this.tone(480, 0.08, 0.16, "triangle");
+    this.audioDirector?.guardRaise(this.player.flipX ? -1 : 1);
   }
 
   updateAttackZone() {
@@ -674,6 +650,7 @@ export class NaveScene extends Phaser.Scene {
         if (Math.abs(distance) < 86 && time > enemy.nextAttackAt) {
           enemy.attackingUntil = time + 360;
           enemy.nextAttackAt = time + 1250;
+          this.audioDirector?.enemyWindup(enemy.kind, enemy.x);
           enemy.anims.stop();
           enemy.setTexture("mourner-model", 2);
           enemy.setVelocityX(0);
@@ -701,22 +678,23 @@ export class NaveScene extends Phaser.Scene {
       const direction = distance > 0 ? 1 : -1;
       boss.anims.stop();
       boss.setTexture("bishop-model", 2);
-      this.fireProjectile(boss, direction, 300);
-      this.time.delayedCall(220, () => { if (boss.active) this.fireProjectile(boss, direction, 255); });
+      this.audioDirector?.enemyWindup("boss", boss.x);
+      this.fireProjectile(boss, direction, 300, 0);
+      this.time.delayedCall(220, () => { if (boss.active) this.fireProjectile(boss, direction, 255, 1); });
       this.time.delayedCall(520, () => { if (boss.active) boss.play("bishop"); });
       boss.nextAttackAt = time + (boss.hp < 7 ? 1050 : 1550);
       this.cameras.main.shake(120, 0.002);
     }
   }
 
-  fireProjectile(source, direction, speed) {
+  fireProjectile(source, direction, speed, shotIndex = 0) {
     const projectile = this.projectiles.create(source.x + direction * 25, source.y - 10, "projectile").setDepth(6);
     projectile.setVelocityX(direction * speed);
     projectile.setFlipX(direction < 0);
     projectile.body.setSize(16, 8);
     projectile.setData("damage", source.kind === "boss" ? 2 : 1);
     this.time.delayedCall(3500, () => projectile.active && projectile.destroy());
-    this.tone(115, 0.16, 0.12, "sawtooth");
+    this.audioDirector?.projectileLaunch(source.kind, source.x, shotIndex);
   }
 
   hitByProjectile(projectile) {
@@ -725,7 +703,7 @@ export class NaveScene extends Phaser.Scene {
       projectile.destroy();
       this.gameState.fervour = Math.min(100, this.gameState.fervour + 18);
       this.flash(0xd3b15d, 90);
-      this.tone(720, 0.12, 0.32, "square");
+      this.audioDirector?.parrySuccess("projectile");
       this.updateHud();
       return;
     }
@@ -742,7 +720,7 @@ export class NaveScene extends Phaser.Scene {
       enemy.tint = 0xf4d279;
       this.time.delayedCall(100, () => enemy.active && enemy.clearTint());
       this.gameState.fervour = Math.min(100, this.gameState.fervour + 12);
-      this.tone(640, 0.1, 0.28, "square");
+      this.audioDirector?.parrySuccess("melee");
       this.updateHud();
       return;
     }
@@ -766,7 +744,7 @@ export class NaveScene extends Phaser.Scene {
     enemy.setTintFill(0xe0cfad);
     this.time.delayedCall(75, () => enemy.active && enemy.clearTint());
     this.gameState.fervour = Math.min(100, this.gameState.fervour + 9);
-    this.tone(95, 0.1, 0.32, "square");
+    this.audioDirector?.weaponHit(enemy.kind);
     this.cameras.main.shake(80, 0.0028);
     this.bloodBurst(enemy.x, enemy.y);
 
@@ -794,7 +772,7 @@ export class NaveScene extends Phaser.Scene {
     this.tweens.add({ targets: this.player, alpha: 0.28, duration: 70, yoyo: true, repeat: 5 });
     this.cameras.main.shake(180, 0.006);
     this.flash(0x651314, 130);
-    this.tone(70, 0.24, 0.36, "sawtooth");
+    this.audioDirector?.playerHurt(amount);
     this.updateHud();
     if (this.gameState.health <= 0) this.killPlayer();
   }
@@ -881,6 +859,7 @@ export class NaveScene extends Phaser.Scene {
     boss.maxHp = 14;
     boss.nextAttackAt = this.time.now + 1400;
     this.boss = boss;
+    this.audioDirector?.setBossActive(true);
     this.bossHud.setVisible(true).setAlpha(0);
     this.tweens.add({ targets: this.bossHud, alpha: 1, duration: 800 });
     this.cameras.main.shake(700, 0.004);
@@ -890,6 +869,7 @@ export class NaveScene extends Phaser.Scene {
   defeatBoss() {
     this.gameState.bossDead = true;
     this.gameState.won = true;
+    this.audioDirector?.setBossActive(false);
     this.bossBar.displayWidth = 0;
     this.cameras.main.shake(1000, 0.009);
     this.flash(0xd4b15c, 600);
