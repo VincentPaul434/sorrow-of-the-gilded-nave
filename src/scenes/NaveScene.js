@@ -1,22 +1,18 @@
 import Phaser from "phaser";
 import { NaveAudio } from "../game/audio.js";
 import { createTextures } from "../game/textures.js";
+import { ENVIRONMENT_SPEC, HUD_SPEC, assertGridAligned } from "../game/layout-spec.js";
+import { GILDED_NAVE_KIT } from "../game/kitbash/gilded-nave-kit.js";
+import { GILDED_NAVE_LEVEL, NAVE_REVIEW_VIEWS } from "../game/kitbash/gilded-nave-level.js";
+import { validateNaveLevelManifest, validateNaveLevelTextures } from "../game/kitbash/validate-level-manifest.js";
 
-const WORLD_WIDTH = 5400;
-const WORLD_HEIGHT = 720;
-const BASE_FLOOR_TOP = 616;
-const CHECKPOINT_POSITION = { x: 3136, y: 360 };
-const PHASE_THREE = {
-  enterX: 3264,
-  cameraLeft: 2880,
-  exitX: 4144,
-};
-const APSE_GATE = {
-  x: 4064,
-  openY: 80,
-  closedY: 275,
-  triggerX: 4280,
-};
+const WORLD_WIDTH = GILDED_NAVE_LEVEL.world.width;
+const WORLD_HEIGHT = GILDED_NAVE_LEVEL.world.height;
+const BASE_FLOOR_TOP = GILDED_NAVE_LEVEL.world.baseFloorTop;
+const CHECKPOINT_POSITION = GILDED_NAVE_LEVEL.traversal.checkpoint.respawn;
+const PHASE_THREE = GILDED_NAVE_LEVEL.camera.phaseThree;
+const APSE_GATE = GILDED_NAVE_LEVEL.apse.gate;
+const REVIEW_VIEWS = NAVE_REVIEW_VIEWS;
 
 export class NaveScene extends Phaser.Scene {
   constructor() {
@@ -24,7 +20,7 @@ export class NaveScene extends Phaser.Scene {
   }
 
   preload() {
-    this.load.image("concept", "/assets/gilded-nave-concept.png");
+    GILDED_NAVE_LEVEL.resources.images.forEach(({ key, url }) => this.load.image(key, url));
     this.load.spritesheet("penitent-idle-animation", "/assets/characters/penitent-idle-animation.png", { frameWidth: 360, frameHeight: 320 });
     this.load.spritesheet("penitent-run-animation", "/assets/characters/penitent-run-animation.png", { frameWidth: 360, frameHeight: 320 });
     this.load.spritesheet("penitent-attack-animation", "/assets/characters/penitent-attack-animation.png", { frameWidth: 360, frameHeight: 320 });
@@ -33,25 +29,36 @@ export class NaveScene extends Phaser.Scene {
   }
 
   create() {
+    validateNaveLevelManifest(GILDED_NAVE_LEVEL, GILDED_NAVE_KIT);
     createTextures(this);
+    validateNaveLevelTextures(this, GILDED_NAVE_KIT);
     this.createCharacterAnimations();
     this.audioDirector = new NaveAudio(this);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.audioDirector?.stop());
     if (this.sound.context?.state === "running") this.audioDirector.start();
     this.physics.world.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
     this.cameras.main.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
-    this.cameras.main.setBackgroundColor("#090807");
+    this.cameras.main.setBackgroundColor(GILDED_NAVE_LEVEL.world.cameraBackground);
+    const requestedReviewView = import.meta.env.DEV
+      ? new URLSearchParams(globalThis.location.search).get("view")
+      : null;
+    this.reviewView = requestedReviewView && REVIEW_VIEWS[requestedReviewView]
+      ? requestedReviewView
+      : null;
 
     this.gameState = {
       health: 5,
       maxHealth: 5,
       fervour: 0,
-      checkpoint: { x: 150, y: BASE_FLOOR_TOP },
+      checkpoint: { ...GILDED_NAVE_LEVEL.world.initialCheckpoint },
       relicActivated: false,
       bossAwake: false,
       bossDead: false,
       won: false,
       deaths: 0,
+      resourceCount: 0,
+      itemCharges: 3,
+      maxItemCharges: 3,
     };
     this.attackSerial = 0;
     this.lastGroundedAt = 0;
@@ -62,6 +69,8 @@ export class NaveScene extends Phaser.Scene {
     this.nextStepAt = 0;
     this.touchState = { left: false, right: false, jump: false, attack: false };
     this.cameraMode = "follow";
+    this.isClimbing = false;
+    this.activeLadder = null;
 
     this.drawCathedral();
     this.createLevel();
@@ -70,7 +79,7 @@ export class NaveScene extends Phaser.Scene {
     this.createInput();
     this.createHud();
     this.createAtmosphere();
-    this.createIntro();
+    if (!this.reviewView) this.createIntro();
 
     this.physics.add.collider(this.player, this.solids);
     this.physics.add.collider(this.enemies, this.solids);
@@ -85,10 +94,19 @@ export class NaveScene extends Phaser.Scene {
     this.physics.add.overlap(this.player, this.enemies, (player, enemy) => this.touchEnemy(enemy));
     this.physics.add.overlap(this.player, this.projectiles, (player, projectile) => this.hitByProjectile(projectile));
     this.physics.add.overlap(this.attackZone, this.enemies, (zone, enemy) => this.hitEnemy(enemy));
-    this.physics.add.overlap(this.player, this.relic, () => this.activateCheckpoint());
+    this.physics.add.overlap(this.player, this.relicTrigger, () => this.activateCheckpoint());
 
     this.cameras.main.startFollow(this.player, true, 0.09, 0.08, -220, 50);
     this.cameras.main.setDeadzone(170, 90);
+    const review = REVIEW_VIEWS[this.reviewView];
+    if (review) {
+      this.player.body.reset(review.playerX, review.playerY);
+      this.player.setAcceleration(0, 0).setVelocity(0, 0);
+      this.cameraMode = review.cameraMode;
+      this.cameras.main.stopFollow();
+      this.cameras.main.setScroll(review.scrollX, 0);
+      this.areaTitle.setVisible(false);
+    }
     this.cameras.main.fadeIn(500, 7, 5, 4);
   }
 
@@ -101,136 +119,166 @@ export class NaveScene extends Phaser.Scene {
   }
 
   drawCathedral() {
-    const base = this.add.graphics().setDepth(-40);
-    base.fillStyle(0x070706, 1).fillRect(0, 0, WORLD_WIDTH, 720);
+    this.backgroundLayers = { far: [], mid: [], near: [] };
+    const resolveAsset = (assetId) => GILDED_NAVE_KIT.assets[assetId];
+    const register = (layer, object) => {
+      object.setDepth(layer.depth).setScrollFactor(layer.scrollFactor, 1);
+      this.backgroundLayers[layer.id].push(object);
+      return object;
+    };
 
-    // Use the character-free side of the concept only as a distant value plate.
-    // Heavy tinting and slower parallax prevent its ledges from reading as play.
-    const crop = { x: 610, y: 0, width: 1062, height: 800 };
-    const artScaleX = 1380 / crop.width;
-    for (let panel = 0; panel < 5; panel += 1) {
-      const art = this.add.image(panel * 1320 - crop.x * artScaleX, 0, "concept")
-        .setOrigin(0, 0)
-        .setCrop(crop.x, crop.y, crop.width, crop.height)
-        .setScale(artScaleX, 720 / crop.height)
-        .setAlpha(panel % 2 === 0 ? 0.3 : 0.22)
-        .setTint(panel % 2 === 0 ? 0x777067 : 0x5e5953)
-        .setDepth(-36);
-      art.setScrollFactor(0.92, 1);
-    }
+    GILDED_NAVE_LEVEL.background.layers.forEach((layer) => {
+      layer.placements.forEach((placement) => {
+        if (placement.kind === "solid") {
+          const graphics = register(layer, this.add.graphics());
+          graphics.fillStyle(placement.color, placement.alpha).fillRect(
+            placement.rect.x,
+            placement.rect.y,
+            placement.rect.width,
+            placement.rect.height,
+          );
+          return;
+        }
 
-    const veil = this.add.graphics().setDepth(-34);
-    veil.fillStyle(0x080706, 0.3).fillRect(0, 0, WORLD_WIDTH, 260);
-    veil.fillStyle(0x080706, 0.42).fillRect(0, 260, WORLD_WIDTH, 150);
-    veil.fillStyle(0x080706, 0.62).fillRect(0, 410, WORLD_WIDTH, 115);
-    veil.fillStyle(0x080706, 0.82).fillRect(0, 525, WORLD_WIDTH, 195);
-    veil.setScrollFactor(0.94, 1);
+        if (placement.kind === "tile") {
+          const asset = resolveAsset(placement.asset);
+          const tile = this.add.tileSprite(
+            placement.rect.x,
+            placement.rect.y,
+            placement.rect.width,
+            placement.rect.height,
+            asset.texture,
+          ).setOrigin(...asset.origin).setAlpha(placement.alpha ?? 1);
+          if (placement.tint !== undefined) tile.setTint(placement.tint);
+          register(layer, tile);
+          return;
+        }
 
-    const architecture = this.add.graphics().setDepth(-20).setScrollFactor(0.965, 1);
-    for (let x = 280; x < WORLD_WIDTH; x += 680) {
-      architecture.fillStyle(0x0a0908, 0.95).fillRect(x - 40, 0, 116, 620);
-      architecture.fillStyle(0x201d1a, 1).fillRect(x - 24, 38, 84, 570);
-      architecture.fillStyle(0x443d35, 0.8).fillRect(x - 18, 62, 8, 515);
-      architecture.fillStyle(0x151210, 1).fillRect(x + 39, 62, 15, 515);
-      architecture.fillStyle(0x66533b, 0.75).fillRect(x - 7, 86, 3, 470);
-      architecture.fillStyle(0x100e0d, 1).fillRect(x - 52, 0, 140, 42);
-      architecture.fillStyle(0x39332d, 1).fillRect(x - 62, 37, 160, 18);
-      architecture.fillStyle(0x151311, 1).fillRect(x - 72, 574, 180, 42);
-      architecture.fillStyle(0x443b32, 1).fillRect(x - 82, 574, 200, 10);
-      architecture.fillStyle(0x8b6228, 0.75).fillRect(x - 43, 112, 119, 3);
-      architecture.fillStyle(0xb58738, 0.45).fillRect(x - 32, 123, 97, 2);
-      for (let chip = 0; chip < 18; chip += 1) {
-        const px = x - 28 + ((chip * 37) % 82);
-        const py = 150 + ((chip * 71) % 390);
-        architecture.fillStyle(chip % 3 === 0 ? 0x756e63 : 0x161412, 0.8).fillRect(px, py, chip % 4 === 0 ? 4 : 2, 2);
-      }
-    }
+        if (placement.kind === "image") {
+          const asset = resolveAsset(placement.asset);
+          const image = this.add.image(placement.at.x, placement.at.y, asset.texture)
+            .setOrigin(...asset.origin)
+            .setAlpha(placement.alpha ?? 1);
+          if (placement.tint !== undefined) image.setTint(placement.tint);
+          register(layer, image);
+          return;
+        }
 
-    // Recessed devotional bays keep the lower gameplay plane detailed without
-    // competing with silhouettes and hazards.
-    const bays = this.add.graphics().setDepth(-17).setScrollFactor(0.955, 1);
-    for (let x = 80; x < WORLD_WIDTH; x += 430) {
-      bays.fillStyle(0x080706, 0.68).fillRoundedRect(x, 330, 250, 285, 80);
-      bays.lineStyle(5, 0x302a25, 0.82).strokeRoundedRect(x, 330, 250, 285, 80);
-      bays.lineStyle(2, 0x765023, 0.68).strokeRoundedRect(x + 12, 342, 226, 259, 69);
-      bays.lineStyle(1, 0xb18843, 0.32).strokeRoundedRect(x + 20, 350, 210, 242, 62);
-      bays.fillStyle(0x4b1011, 0.5).fillRect(x + 85, 392, 80, 175);
-      bays.fillStyle(0xa67a34, 0.55).fillCircle(x + 125, 426, 23);
-      bays.fillStyle(0x151210, 0.96).fillRect(x + 116, 447, 18, 82);
-      bays.fillTriangle(x + 125, 492, x + 88, 556, x + 162, 556);
-      for (let bead = 0; bead < 16; bead += 1) {
-        const bx = x + 27 + ((bead * 43) % 196);
-        const by = 362 + ((bead * 67) % 210);
-        bays.fillStyle(bead % 3 === 0 ? 0xb78b3c : 0x6f4d23, bead % 3 === 0 ? 0.65 : 0.4).fillRect(bx, by, bead % 4 === 0 ? 3 : 2, 2);
-      }
-    }
+        if (placement.kind === "repeat") {
+          const asset = resolveAsset(placement.asset);
+          for (let index = 0; index < placement.count; index += 1) {
+            const image = this.add.image(
+              placement.at.x + placement.step.x * index,
+              placement.at.y + placement.step.y * index,
+              asset.texture,
+            ).setOrigin(...asset.origin).setAlpha(placement.alpha ?? 1);
+            const tints = placement.alternatingTints;
+            if (tints?.length) image.setTint(tints[index % tints.length]);
+            register(layer, image);
+          }
+          return;
+        }
 
-    const shrinePositions = [1130, 2440, 3760, 5050];
-    shrinePositions.forEach((x, index) => {
-      const statue = this.add.image(x, 495, "weeping-statue")
-        .setOrigin(0.5, 1)
-        .setScale(index % 2 === 0 ? 1.15 : 1.32)
-        .setAlpha(0.38)
-        .setTint(index % 2 === 0 ? 0xaaa49a : 0x7c7770)
-        .setDepth(-10)
-        .setScrollFactor(0.97, 1);
-      if (index % 2) statue.setFlipX(true);
+        if (placement.kind === "rects") {
+          const graphics = register(layer, this.add.graphics());
+          placement.rects.forEach((rect) => {
+            graphics.fillStyle(rect.color, rect.alpha).fillRect(rect.x, rect.y, rect.width, rect.height);
+          });
+          return;
+        }
+
+        if (placement.kind === "triangles") {
+          const graphics = this.add.graphics();
+          if (placement.blendMode === "ADD") graphics.setBlendMode(Phaser.BlendModes.ADD);
+          register(layer, graphics);
+          placement.triangles.forEach(({ points, color, alpha }) => {
+            graphics.fillStyle(color, alpha).fillTriangle(...points.flat());
+          });
+          return;
+        }
+
+        if (placement.kind === "recipe" && placement.recipe === "hangingCenser") {
+          const recipe = GILDED_NAVE_KIT.recipes.hangingCenser;
+          const link = resolveAsset(recipe.linkAsset);
+          const terminal = resolveAsset(recipe.terminalAsset);
+          for (let offsetY = 0; offsetY < placement.length; offsetY += recipe.linkStrideY) {
+            register(layer, this.add.image(
+              placement.at.x - link.size[0] / 2 + ((offsetY / recipe.linkStrideY) % 2),
+              placement.at.y + offsetY,
+              link.texture,
+            ).setOrigin(...link.origin));
+          }
+          register(layer, this.add.image(
+            placement.at.x + recipe.terminalOffset[0],
+            placement.at.y + placement.length + recipe.terminalOffset[1],
+            terminal.texture,
+          ).setOrigin(...terminal.origin));
+        }
+      });
     });
-
-    [620, 2150, 4890].forEach((x, index) => {
-      this.add.tileSprite(x, 238 + index * 8, 360, 48, "background-railing")
-        .setAlpha(0.42)
-        .setTint(0x625a50)
-        .setDepth(-8)
-        .setScrollFactor(0.975, 1);
-    });
-
-    const chains = this.add.graphics().setDepth(-6).setScrollFactor(0.95, 1);
-    [520, 1710, 3100, 4260].forEach((x, index) => {
-      const length = index % 2 === 0 ? 175 : 245;
-      chains.lineStyle(3, 0x090807, 1).lineBetween(x, 0, x, length);
-      chains.lineStyle(1, 0x80603a, 0.8).lineBetween(x + 2, 0, x + 2, length);
-      this.add.image(x, length + 12, "decorative-censer")
-        .setScale(0.78)
-        .setAlpha(0.55)
-        .setDepth(-5)
-        .setScrollFactor(0.95, 1);
-    });
-
-    const shafts = this.add.graphics().setDepth(-4).setBlendMode(Phaser.BlendModes.ADD).setScrollFactor(0.98, 1);
-    shafts.fillStyle(0xe3d0a0, 0.045).fillTriangle(990, 0, 1080, 0, 1270, 500);
-    shafts.fillStyle(0xf0d89d, 0.06).fillTriangle(2960, 0, 3060, 0, 3220, 345);
-    shafts.fillStyle(0xf1d89d, 0.075).fillTriangle(4310, 0, 4410, 0, 4470, 285);
   }
 
   createLevel() {
     this.solids = this.physics.add.staticGroup();
     this.spikes = this.physics.add.staticGroup();
     this.gates = this.physics.add.staticGroup();
-    this.levelSurfaces = [
-      // Phase 1 and the Phase 2 approach share one uninterrupted safety floor.
-      { start: 0, end: 1600, top: 616, phase: 1 },
-      // Phase 2: four supported 64 px steps, with no alternate lower route.
-      { start: 1600, end: 1920, top: 552, phase: 2 },
-      { start: 1920, end: 2240, top: 488, phase: 2 },
-      { start: 2240, end: 2560, top: 424, phase: 2 },
-      { start: 2560, end: 3456, top: 360, phase: 2 },
-      // Phase 3: one upward jump and one wide, forgiving downward landing.
-      { start: 3552, end: 3808, top: 296, phase: 3 },
-      { start: 3872, end: 4192, top: 360, phase: 3 },
-      // The boss floor is continuous and terminates in visible architecture.
-      { start: 4192, end: WORLD_WIDTH, top: 360, phase: 4 },
-    ];
-
-    const supportedSurface = ({ start, end, top }) => {
+    this.ladders = this.physics.add.staticGroup();
+    this.levelSurfaces = GILDED_NAVE_LEVEL.traversal.surfaces;
+    const surfaceRecipe = GILDED_NAVE_KIT.recipes.gildedSurface;
+    const supportedSurface = ({
+      id,
+      start,
+      end,
+      top,
+      variantSeed,
+      underhangSeed,
+      fillToBottom = false,
+      brokenLeft = false,
+      brokenRight = false,
+    }) => {
+      assertGridAligned(start, "surface start");
+      assertGridAligned(end, "surface end");
+      assertGridAligned(top, "surface top", ENVIRONMENT_SPEC.surfaceOriginY);
       const width = end - start;
+      if (width % surfaceRecipe.moduleWidth !== 0) {
+        throw new Error(`${id} width ${width} must use ${surfaceRecipe.moduleWidth}px modules.`);
+      }
       const height = WORLD_HEIGHT - top;
+      const visualHeight = fillToBottom ? height : Math.min(height, surfaceRecipe.elevatedFaceHeight);
       const x = start + width / 2;
       const y = top + height / 2;
 
-      this.add.tileSprite(x, y, width, height, "stone").setDepth(1);
-      this.add.rectangle(x, top + 2, width, 4, 0xc4bca8, 0.9).setDepth(2);
-      this.add.rectangle(x, top + 7, width, 3, 0x12110f, 0.95).setDepth(2);
+      for (let moduleX = start; moduleX < end; moduleX += surfaceRecipe.moduleWidth) {
+        const localModuleIndex = (moduleX - start) / surfaceRecipe.moduleWidth;
+        const variantIndex = (localModuleIndex + variantSeed) % surfaceRecipe.variants.length;
+        const variant = surfaceRecipe.variants[variantIndex];
+        const isFirst = moduleX === start;
+        const isLast = moduleX === end - surfaceRecipe.moduleWidth;
+
+        if (brokenLeft && isFirst) {
+          this.add.image(moduleX, top, surfaceRecipe.caps.brokenLeft.outer).setOrigin(0, 0).setDepth(surfaceRecipe.depths.cap);
+          this.add.image(moduleX + 32, top, surfaceRecipe.caps.brokenLeft.inner).setOrigin(0, 0).setDepth(surfaceRecipe.depths.face);
+        } else if (brokenRight && isLast) {
+          this.add.image(moduleX, top, surfaceRecipe.caps.brokenRight.inner).setOrigin(0, 0).setDepth(surfaceRecipe.depths.face);
+          this.add.image(moduleX + 32, top, surfaceRecipe.caps.brokenRight.outer).setOrigin(0, 0).setDepth(surfaceRecipe.depths.cap);
+        } else {
+          this.add.image(moduleX, top, variant.top).setOrigin(0, 0).setDepth(surfaceRecipe.depths.face);
+        }
+
+        if (visualHeight > 32) {
+          this.add.tileSprite(moduleX, top + 32, surfaceRecipe.moduleWidth, visualHeight - 32, variant.fill)
+            .setOrigin(0, 0)
+            .setDepth(surfaceRecipe.depths.face);
+        }
+        const isBrokenModule = (brokenLeft && isFirst) || (brokenRight && isLast);
+        const underhangRule = surfaceRecipe.underhangRule;
+        const excluded = (localModuleIndex + underhangSeed) % underhangRule.modulus === underhangRule.excludedRemainder;
+        if (!fillToBottom && !(underhangRule.excludeBroken && isBrokenModule) && !excluded) {
+          this.add.image(moduleX, top + visualHeight, variant.underhang)
+            .setOrigin(0, 0)
+            .setDepth(surfaceRecipe.depths.underhang);
+        }
+      }
 
       const body = this.solids.create(x, y, "white").setVisible(false);
       body.displayWidth = width;
@@ -240,86 +288,131 @@ export class NaveScene extends Phaser.Scene {
 
     this.levelSurfaces.forEach(supportedSurface);
 
-    const pits = this.add.graphics().setDepth(0);
-    pits.fillStyle(0x030303, 0.97);
-    pits.fillRect(3456, 360, 96, WORLD_HEIGHT - 360);
-    pits.fillRect(3808, 296, 64, WORLD_HEIGHT - 296);
+    const pits = this.add.graphics().setDepth(GILDED_NAVE_KIT.depths.void);
+    GILDED_NAVE_LEVEL.traversal.pits.forEach((pit) => {
+      pits.fillStyle(pit.color, pit.alpha).fillRect(pit.x, pit.y, pit.width, pit.height);
+    });
 
-    const addSpikeBed = (start, end, baseY, count) => {
-      const width = end - start;
-      this.add.rectangle(start + width / 2, baseY - 3, width, 6, 0x4c281c, 1)
-        .setStrokeStyle(1, 0x8b5c2e, 0.8)
-        .setDepth(1);
+    this.ladderArt = [];
+    GILDED_NAVE_LEVEL.traversal.ladders.forEach((placement) => {
+      const recipe = GILDED_NAVE_KIT.recipes[placement.recipe];
+      const asset = GILDED_NAVE_KIT.assets[recipe.asset];
+      const centerX = placement.x + recipe.sensor.offsetX;
+      assertGridAligned(placement.x, "ladder x");
+      assertGridAligned(placement.y, "ladder y", ENVIRONMENT_SPEC.surfaceOriginY);
+      this.ladderArt.push(this.add.image(placement.x, placement.y, asset.texture)
+        .setOrigin(...asset.origin)
+        .setDepth(GILDED_NAVE_KIT.depths.interactionArt));
+      const ladder = this.ladders.create(
+        centerX,
+        placement.y + recipe.sensor.offsetY,
+        "white",
+      )
+        .setOrigin(...recipe.sensor.origin)
+        .setVisible(false);
+      ladder.displayWidth = recipe.sensor.width;
+      ladder.displayHeight = recipe.sensor.height;
+      ladder.refreshBody();
+      ladder.setData({
+        id: placement.id,
+        centerX,
+        upperX: placement.upperExit.x,
+        upperY: placement.upperExit.y,
+        lowerX: placement.lowerExit.x,
+        lowerY: placement.lowerExit.y,
+      });
+    });
 
-      for (let i = 0; i < count; i += 1) {
-        const spike = this.spikes.create(start + 16 + i * 32, baseY, "spike")
-          .setOrigin(0.5, 1)
-          .setDepth(3);
+    GILDED_NAVE_LEVEL.traversal.hazards.forEach((hazard) => {
+      const recipe = GILDED_NAVE_KIT.recipes[hazard.recipe];
+      const asset = GILDED_NAVE_KIT.assets[recipe.asset];
+      for (let trapX = hazard.start; trapX < hazard.end; trapX += recipe.moduleWidth) {
+        const spike = this.spikes.create(trapX + recipe.moduleWidth / 2, hazard.baseY, asset.texture)
+          .setOrigin(...asset.origin)
+          .setDepth(GILDED_NAVE_KIT.depths.decoration);
         spike.refreshBody();
-        spike.body.setSize(24, 32).setOffset(4, 4);
+        spike.body.setSize(recipe.sensor.width, recipe.sensor.height)
+          .setOffset(recipe.sensor.offsetX, recipe.sensor.offsetY);
       }
-    };
+    });
 
-    addSpikeBed(3808, 3872, 360, 2);
+    const checkpoint = GILDED_NAVE_LEVEL.traversal.checkpoint;
+    const checkpointRecipe = GILDED_NAVE_KIT.recipes[checkpoint.recipe];
+    const checkpointAsset = GILDED_NAVE_KIT.assets[checkpointRecipe.asset];
+    this.relic = this.add.image(checkpoint.x, checkpoint.y, checkpointAsset.texture)
+      .setOrigin(...checkpointAsset.origin)
+      .setDepth(GILDED_NAVE_KIT.depths.interactionArt);
+    this.relicTrigger = this.physics.add.staticImage(
+      checkpoint.x + checkpointRecipe.sensor.offsetX,
+      checkpoint.y + checkpointRecipe.sensor.offsetY,
+      "white",
+    )
+      .setVisible(false);
+    this.relicTrigger.displayWidth = checkpointRecipe.sensor.width;
+    this.relicTrigger.displayHeight = checkpointRecipe.sensor.height;
+    this.relicTrigger.refreshBody();
 
-    this.relic = this.physics.add.staticImage(CHECKPOINT_POSITION.x, CHECKPOINT_POSITION.y, "reliquary")
-      .setOrigin(0.5, 1)
-      .setDepth(4);
-    this.relic.refreshBody();
-    this.relic.body.setSize(44, 72).setOffset(4, 8);
-
-    const apse = this.add.graphics().setDepth(0);
-    apse.fillStyle(0x060504, 0.96).fillRoundedRect(APSE_GATE.x - 82, 18, 164, 342, 72);
-    apse.lineStyle(7, 0x2f251c, 1).strokeRoundedRect(APSE_GATE.x - 82, 18, 164, 342, 72);
-    apse.lineStyle(2, 0x8b6228, 0.86).strokeRoundedRect(APSE_GATE.x - 70, 30, 140, 318, 62);
-    apse.lineStyle(1, 0xc0923f, 0.5).strokeRoundedRect(APSE_GATE.x - 62, 38, 124, 302, 56);
-    this.apseLight = this.add.rectangle(APSE_GATE.x, 190, 10, 316, 0xe0d4b8, 0.24)
+    const apseSpec = GILDED_NAVE_LEVEL.apse;
+    const apse = this.add.graphics().setDepth(GILDED_NAVE_KIT.depths.void);
+    apseSpec.architecture.fills.forEach((fill) => {
+      apse.fillStyle(fill.color, fill.alpha).fillRect(fill.x, fill.y, fill.width, fill.height);
+    });
+    apseSpec.architecture.strokes.forEach((stroke) => {
+      apse.lineStyle(stroke.lineWidth, stroke.color, stroke.alpha)
+        .strokeRect(stroke.x, stroke.y, stroke.width, stroke.height);
+    });
+    const light = apseSpec.light;
+    this.apseLight = this.add.rectangle(light.x, light.y, light.width, light.height, light.color, light.alpha)
       .setBlendMode(Phaser.BlendModes.ADD)
-      .setDepth(0);
-    this.tweens.add({ targets: this.apseLight, alpha: 0.12, duration: 900, yoyo: true, repeat: -1 });
+      .setDepth(GILDED_NAVE_KIT.depths.void);
+    this.tweens.add({ targets: this.apseLight, alpha: light.pulseAlpha, duration: light.duration, yoyo: true, repeat: -1 });
 
-    this.bossGate = this.gates.create(APSE_GATE.x, APSE_GATE.openY, "gate")
-      .setDepth(3)
+    const gateAsset = GILDED_NAVE_KIT.assets[APSE_GATE.asset];
+    this.bossGate = this.gates.create(APSE_GATE.x, APSE_GATE.openY, gateAsset.texture)
+      .setDepth(GILDED_NAVE_KIT.depths.decoration)
       .setVisible(true);
     this.bossGate.body.enable = false;
 
-    const entranceWallWidth = 64;
-    const entranceWallHeight = BASE_FLOOR_TOP;
-    this.add.tileSprite(entranceWallWidth / 2, entranceWallHeight / 2, entranceWallWidth, entranceWallHeight, "stone").setDepth(1);
-    this.add.rectangle(entranceWallWidth - 2, entranceWallHeight / 2, 4, entranceWallHeight, 0xa7a398, 0.5).setDepth(2);
-    const entranceBody = this.solids.create(entranceWallWidth / 2, entranceWallHeight / 2, "white").setVisible(false);
-    entranceBody.displayWidth = entranceWallWidth;
-    entranceBody.displayHeight = entranceWallHeight;
-    entranceBody.refreshBody();
+    GILDED_NAVE_LEVEL.traversal.boundaries.forEach((boundary) => {
+      const asset = GILDED_NAVE_KIT.assets[boundary.asset];
+      const { x, y, width, height } = boundary.rect;
+      this.add.tileSprite(x, y, width, height, asset.texture)
+        .setOrigin(...asset.origin)
+        .setDepth(GILDED_NAVE_KIT.depths.surface);
+      const body = this.solids.create(x + width / 2, y + height / 2, "white").setVisible(false);
+      body.displayWidth = width;
+      body.displayHeight = height;
+      body.refreshBody();
+    });
 
-    const terminalWallWidth = 80;
-    const terminalWallHeight = 360;
-    const terminalWallX = WORLD_WIDTH - terminalWallWidth / 2;
-    this.add.tileSprite(terminalWallX, terminalWallHeight / 2, terminalWallWidth, terminalWallHeight, "stone").setDepth(1);
-    this.add.rectangle(terminalWallX - terminalWallWidth / 2 + 2, terminalWallHeight / 2, 4, terminalWallHeight, 0xa7a398, 0.62).setDepth(2);
-    const terminalBody = this.solids.create(terminalWallX, terminalWallHeight / 2, "white").setVisible(false);
-    terminalBody.displayWidth = terminalWallWidth;
-    terminalBody.displayHeight = terminalWallHeight;
-    terminalBody.refreshBody();
-
-    const candleBank = (x, surfaceY, count, seed) => {
-      for (let i = 0; i < count; i += 1) {
-        const candleX = x + i * 8;
-        const candleHeight = 10 + ((seed * 7 + i * 11) % 14);
-        const candle = this.add.rectangle(candleX, surfaceY - candleHeight / 2, 3, candleHeight, 0xbeb49d, 0.58).setDepth(0);
-        const flame = this.add.rectangle(candleX, candle.y - candle.height / 2 - 4, 2, 5, 0xd39b40, 0.7).setDepth(0);
-        this.tweens.add({ targets: flame, alpha: 0.25, scaleY: 1.35, duration: 420 + i * 70, yoyo: true, repeat: -1 });
+    GILDED_NAVE_LEVEL.dressing.placements.forEach((placement) => {
+      if (placement.kind === "image") {
+        const asset = GILDED_NAVE_KIT.assets[placement.asset];
+        this.add.image(placement.at.x, placement.at.y, asset.texture)
+          .setOrigin(...asset.origin)
+          .setDepth(GILDED_NAVE_KIT.depths.decoration);
+        return;
       }
-    };
-
-    candleBank(300, 616, 3, 1);
-    candleBank(1110, 616, 3, 2);
-    candleBank(3050, 360, 3, 3);
-    candleBank(5150, 360, 3, 5);
+      if (placement.kind === "recipe" && placement.recipe === "candelabrum") {
+        const recipe = GILDED_NAVE_KIT.recipes.candelabrum;
+        const root = GILDED_NAVE_KIT.assets[recipe.rootAsset];
+        const flame = GILDED_NAVE_KIT.assets[recipe.flameAsset];
+        this.add.image(placement.at.x, placement.at.y, root.texture)
+          .setOrigin(...root.origin)
+          .setDepth(GILDED_NAVE_KIT.depths.decoration);
+        recipe.flameOffsets.forEach(([offsetX, offsetY]) => {
+          this.add.sprite(placement.at.x + offsetX, placement.at.y + offsetY, flame.texture)
+            .setOrigin(...flame.origin)
+            .setDepth(GILDED_NAVE_KIT.depths.interactionArt)
+            .play(flame.animation);
+        });
+      }
+    });
   }
 
   createPlayer() {
-    this.player = this.physics.add.sprite(150, BASE_FLOOR_TOP, "penitent-idle-animation", 0)
+    const spawn = GILDED_NAVE_LEVEL.world.playerSpawn;
+    this.player = this.physics.add.sprite(spawn.x, spawn.y, "penitent-idle-animation", 0)
       .setOrigin(0.5, 286 / 320)
       .setScale(0.43)
       .setDepth(6);
@@ -334,7 +427,7 @@ export class NaveScene extends Phaser.Scene {
     this.attackZone.body.allowGravity = false;
     this.attackZone.body.enable = false;
 
-    this.playerShadow = this.add.ellipse(this.player.x, BASE_FLOOR_TOP + 2, 46, 9, 0x000000, 0.58).setDepth(4);
+    this.playerShadow = this.add.ellipse(this.player.x, spawn.y + 2, 46, 9, 0x000000, 0.58).setDepth(4);
   }
 
   createEnemies() {
@@ -378,6 +471,10 @@ export class NaveScene extends Phaser.Scene {
       rightAlt: Phaser.Input.Keyboard.KeyCodes.RIGHT,
       jump: Phaser.Input.Keyboard.KeyCodes.SPACE,
       jumpAlt: Phaser.Input.Keyboard.KeyCodes.W,
+      up: Phaser.Input.Keyboard.KeyCodes.UP,
+      upAlt: Phaser.Input.Keyboard.KeyCodes.W,
+      down: Phaser.Input.Keyboard.KeyCodes.DOWN,
+      downAlt: Phaser.Input.Keyboard.KeyCodes.S,
       attack: Phaser.Input.Keyboard.KeyCodes.J,
       attackAlt: Phaser.Input.Keyboard.KeyCodes.X,
       parry: Phaser.Input.Keyboard.KeyCodes.K,
@@ -406,32 +503,49 @@ export class NaveScene extends Phaser.Scene {
   }
 
   createHud() {
-    this.hud = this.add.container(32, 30).setScrollFactor(0).setDepth(40);
-    const crest = this.add.graphics();
-    crest.fillStyle(0x080706, 0.94).fillRect(0, 0, 263, 62);
-    crest.lineStyle(4, 0x171412, 1).strokeRect(0, 0, 263, 62);
-    crest.lineStyle(1, 0x8c632a, 0.95).strokeRect(3, 3, 257, 56);
-    crest.fillStyle(0x2a2018, 1).fillCircle(31, 31, 23);
-    crest.lineStyle(3, 0x4b1011, 1).strokeCircle(31, 31, 20);
-    crest.fillStyle(0x7e1d1b, 1).fillCircle(31, 31, 15);
-    crest.lineStyle(2, 0xc0923f, 0.95).strokeCircle(31, 31, 19);
-    crest.lineStyle(3, 0xd0aa55, 0.9).lineBetween(31, 11, 31, 51);
-    crest.lineStyle(3, 0xd0aa55, 0.9).lineBetween(18, 31, 44, 31);
-    crest.fillStyle(0xc0923f, 0.8).fillTriangle(31, 4, 27, 11, 35, 11);
-    crest.fillStyle(0x503414, 1).fillRect(60, 9, 187, 2);
-    crest.fillStyle(0x503414, 1).fillRect(60, 51, 187, 2);
-    for (let x = 68; x < 246; x += 16) crest.fillStyle(0x8b6228, 0.8).fillRect(x, 7, 2, 6);
-    this.hud.add(crest);
+    const status = HUD_SPEC.status;
+    this.hud = this.add.container(status.x, status.y).setScrollFactor(0).setDepth(40);
+    const statusFrame = this.add.image(0, 0, "hud-status-frame").setOrigin(0, 0);
+    const crest = this.add.image(status.crest.x, status.crest.y, "hud-crest").setOrigin(0, 0);
+    const healthRail = this.add.image(status.healthRail.x, status.healthRail.y, "hud-health-rail").setOrigin(0, 0);
+    const fervourRail = this.add.image(status.fervourRail.x, status.fervourRail.y, "hud-fervour-rail").setOrigin(0, 0);
+    this.fervourBar = this.add.image(status.fervourFill.x, status.fervourFill.y, "hud-fervour-fill").setOrigin(0, 0);
+    this.hud.add([statusFrame, crest, healthRail, fervourRail, this.fervourBar]);
 
     this.healthPips = [];
-    for (let i = 0; i < this.gameState.maxHealth; i += 1) {
-      const pip = this.add.rectangle(66 + i * 33, 21, 26, 9, 0x8b201d, 1).setOrigin(0, 0.5).setStrokeStyle(1, 0x3f1111, 1);
+    for (let i = 0; i < status.healthPips.count; i += 1) {
+      const pip = this.add.image(
+        status.healthPips.x + i * status.healthPips.stride,
+        status.healthPips.y,
+        "hud-health-pip-full",
+      ).setOrigin(0, 0);
       this.hud.add(pip);
       this.healthPips.push(pip);
     }
-    this.fervourBack = this.add.rectangle(66, 42, 159, 6, 0x211d19, 1).setOrigin(0, 0.5).setStrokeStyle(1, 0x503c24, 1);
-    this.fervourBar = this.add.rectangle(68, 42, 0, 4, 0xc0923f, 1).setOrigin(0, 0.5);
-    this.hud.add([this.fervourBack, this.fervourBar]);
+
+    this.itemSlots = [];
+    for (let i = 0; i < status.itemSlots.count; i += 1) {
+      const slot = this.add.image(
+        status.itemSlots.startX + i * status.itemSlots.stride,
+        status.itemSlots.y,
+        "hud-vial-full",
+      ).setOrigin(0, 0);
+      this.hud.add(slot);
+      this.itemSlots.push(slot);
+    }
+
+    const resource = HUD_SPEC.resource;
+    this.resourceHud = this.add.container(resource.x, resource.y).setScrollFactor(0).setDepth(40);
+    const resourceFrame = this.add.image(0, 0, "hud-resource-frame").setOrigin(0, 0);
+    const resourceSigil = this.add.image(resource.sigil.x, resource.sigil.y, "hud-resource-sigil").setOrigin(0, 0);
+    this.resourceHud.add([resourceFrame, resourceSigil]);
+    this.resourceDigits = [];
+    for (let i = 0; i < resource.digitField.maxDigits; i += 1) {
+      const digit = this.add.image(0, resource.digitField.y, "hud-digit-blank").setOrigin(0, 0).setVisible(false);
+      this.resourceHud.add(digit);
+      this.resourceDigits.push(digit);
+    }
+    this.lastRenderedResourceCount = null;
 
     this.areaTitle = this.add.text(640, 105, "THE GILDED NAVE", {
       fontFamily: "Georgia",
@@ -447,36 +561,23 @@ export class NaveScene extends Phaser.Scene {
     this.bossBarBack = this.add.rectangle(0, 12, 640, 10, 0x171311, 0.95).setOrigin(0, 0.5).setStrokeStyle(1, 0x745325, 1);
     this.bossBar = this.add.rectangle(2, 12, 636, 6, 0x821f1d, 1).setOrigin(0, 0.5);
     this.bossHud.add([this.bossName, this.bossBarBack, this.bossBar]);
+    this.updateHud();
   }
 
   createAtmosphere() {
-    this.dust = this.add.particles(0, 0, "white", {
-      x: { min: 0, max: WORLD_WIDTH },
-      y: { min: 20, max: 610 },
-      lifespan: { min: 5000, max: 9000 },
-      speedY: { min: 2, max: 9 },
-      speedX: { min: -4, max: 4 },
-      scale: { min: 0.4, max: 1.25 },
-      alpha: { start: 0.02, end: 0.22 },
-      frequency: 115,
-      quantity: 1,
-      tint: 0xd9c58f,
-    }).setDepth(-5);
+    const atmosphere = GILDED_NAVE_LEVEL.atmosphere;
+    const { depth: dustDepth, ...dustConfig } = atmosphere.dust;
+    this.dust = this.add.particles(0, 0, "white", dustConfig).setDepth(dustDepth);
 
     const foregroundHaze = this.add.graphics().setScrollFactor(0).setDepth(30);
-    foregroundHaze.fillStyle(0x090807, 0.08).fillRect(0, 0, 1280, 44);
-    foregroundHaze.fillStyle(0x090807, 0.08).fillRect(0, 0, 18, 720);
-    foregroundHaze.fillRect(1262, 0, 18, 720);
+    atmosphere.hazeRects.forEach((rect) => {
+      foregroundHaze.fillStyle(rect.color, rect.alpha).fillRect(rect.x, rect.y, rect.width, rect.height);
+    });
 
     const vignette = this.add.graphics().setScrollFactor(0).setDepth(35);
-    vignette.fillStyle(0x000000, 0.4).fillRect(0, 0, 1280, 26);
-    vignette.fillStyle(0x000000, 0.24).fillRect(0, 26, 1280, 30);
-    vignette.fillStyle(0x000000, 0.38).fillRect(0, 687, 1280, 33);
-    vignette.fillStyle(0x000000, 0.21).fillRect(0, 658, 1280, 29);
-    vignette.fillStyle(0x000000, 0.29).fillRect(0, 0, 22, 720);
-    vignette.fillRect(1258, 0, 22, 720);
-    vignette.fillStyle(0x000000, 0.14).fillRect(22, 0, 20, 720);
-    vignette.fillRect(1238, 0, 20, 720);
+    atmosphere.vignetteRects.forEach((rect) => {
+      vignette.fillStyle(rect.color, rect.alpha).fillRect(rect.x, rect.y, rect.width, rect.height);
+    });
   }
 
   createIntro() {
@@ -512,34 +613,43 @@ export class NaveScene extends Phaser.Scene {
     }
     const left = this.keys.left.isDown || this.keys.leftAlt.isDown || this.touchState.left;
     const right = this.keys.right.isDown || this.keys.rightAlt.isDown || this.touchState.right;
-    const jumpPressed = Phaser.Input.Keyboard.JustDown(this.keys.jump) || Phaser.Input.Keyboard.JustDown(this.keys.jumpAlt) || this.consumeTouch("jump");
+    const up = this.keys.up.isDown || this.keys.upAlt.isDown;
+    const down = this.keys.down.isDown || this.keys.downAlt.isDown;
+    const jumpOffPressed = Phaser.Input.Keyboard.JustDown(this.keys.jump);
+    const jumpPressed = jumpOffPressed || Phaser.Input.Keyboard.JustDown(this.keys.jumpAlt) || this.consumeTouch("jump");
     const attackPressed = Phaser.Input.Keyboard.JustDown(this.keys.attack) || Phaser.Input.Keyboard.JustDown(this.keys.attackAlt) || this.consumeTouch("attack");
     const parryPressed = Phaser.Input.Keyboard.JustDown(this.keys.parry) || Phaser.Input.Keyboard.JustDown(this.keys.parryAlt);
+    const ladder = this.isClimbing ? this.activeLadder : this.findOverlappingLadder();
 
-    if (jumpPressed) this.jumpQueuedAt = time;
-    if (this.player.body.blocked.down) this.lastGroundedAt = time;
-
-    if (time > this.attackingUntil && time > this.parryingUntil) {
-      if (left === right) {
-        this.player.setAccelerationX(0);
-      } else {
-        const direction = left ? -1 : 1;
-        this.player.setAccelerationX(direction * 1150);
-        this.player.setFlipX(direction < 0);
-      }
+    if (!this.isClimbing && ladder && (up || down)) this.startClimbing(ladder);
+    if (this.isClimbing) {
+      this.updateLadderMovement({ up, down, left, right, jumpOffPressed });
     } else {
-      this.player.setAccelerationX(0);
-    }
+      if (jumpPressed) this.jumpQueuedAt = time;
+      if (this.player.body.blocked.down) this.lastGroundedAt = time;
 
-    if (time - this.jumpQueuedAt < 120 && time - this.lastGroundedAt < 115 && time > this.attackingUntil) {
-      this.player.setVelocityY(-550);
-      this.jumpQueuedAt = -999;
-      this.lastGroundedAt = -999;
-      this.tone(150, 0.08, 0.18, "triangle");
-    }
+      if (time > this.attackingUntil && time > this.parryingUntil) {
+        if (left === right) {
+          this.player.setAccelerationX(0);
+        } else {
+          const direction = left ? -1 : 1;
+          this.player.setAccelerationX(direction * 1150);
+          this.player.setFlipX(direction < 0);
+        }
+      } else {
+        this.player.setAccelerationX(0);
+      }
 
-    if (attackPressed && time > this.attackingUntil && time > this.parryingUntil) this.attack(time);
-    if (parryPressed && time > this.parryingUntil && time > this.attackingUntil) this.parry(time);
+      if (time - this.jumpQueuedAt < 120 && time - this.lastGroundedAt < 115 && time > this.attackingUntil) {
+        this.player.setVelocityY(-550);
+        this.jumpQueuedAt = -999;
+        this.lastGroundedAt = -999;
+        this.tone(150, 0.08, 0.18, "triangle");
+      }
+
+      if (attackPressed && time > this.attackingUntil && time > this.parryingUntil) this.attack(time);
+      if (parryPressed && time > this.parryingUntil && time > this.attackingUntil) this.parry(time);
+    }
     if (Phaser.Input.Keyboard.JustDown(this.keys.restart) && this.gameState.health <= 0) this.scene.restart();
 
     this.updatePlayerAnimation(time);
@@ -549,9 +659,68 @@ export class NaveScene extends Phaser.Scene {
     this.checkBossTrigger();
 
     const grounded = this.player.body.blocked.down;
-    this.playerShadow.setVisible(grounded);
+    this.playerShadow.setVisible(grounded && !this.isClimbing);
     if (grounded) this.playerShadow.setPosition(this.player.x, this.player.y + 2).setScale(1, 1);
     if (this.player.y > 710) this.killPlayer();
+  }
+
+  findOverlappingLadder() {
+    let found = null;
+    this.physics.overlap(this.player, this.ladders, (_player, ladder) => {
+      if (!found) found = ladder;
+    });
+    return found;
+  }
+
+  startClimbing(ladder) {
+    this.isClimbing = true;
+    this.activeLadder = ladder;
+    this.player.body.allowGravity = false;
+    this.player.setAcceleration(0, 0).setVelocity(0, 0).setX(ladder.getData("centerX"));
+    this.jumpQueuedAt = -999;
+  }
+
+  stopClimbing() {
+    this.isClimbing = false;
+    this.activeLadder = null;
+    this.player.body.allowGravity = true;
+  }
+
+  updateLadderMovement({ up, down, left, right, jumpOffPressed }) {
+    const ladder = this.activeLadder;
+    if (!ladder?.active) {
+      this.stopClimbing();
+      return;
+    }
+
+    if (jumpOffPressed) {
+      const direction = left === right ? (this.player.flipX ? -1 : 1) : (left ? -1 : 1);
+      this.stopClimbing();
+      this.player.setVelocity(direction * 180, -360);
+      return;
+    }
+
+    const upperY = ladder.getData("upperY");
+    const lowerY = ladder.getData("lowerY");
+    if (up && this.player.y <= upperY + 8) {
+      const upperX = ladder.getData("upperX");
+      this.stopClimbing();
+      this.player.body.reset(upperX, upperY - 1);
+      this.player.setVelocity(0, 0);
+      return;
+    }
+    if (down && this.player.y >= lowerY - 2) {
+      const lowerX = ladder.getData("lowerX");
+      this.stopClimbing();
+      this.player.body.reset(lowerX, lowerY - 1);
+      this.player.setVelocity(0, 0);
+      return;
+    }
+
+    const vertical = (down ? 1 : 0) - (up ? 1 : 0);
+    this.player.setX(ladder.getData("centerX"));
+    this.player.setAcceleration(0, 0);
+    this.player.setVelocity(0, vertical * ENVIRONMENT_SPEC.ladder.climbSpeed);
   }
 
   updateTutorialCamera() {
@@ -584,6 +753,11 @@ export class NaveScene extends Phaser.Scene {
   }
 
   updatePlayerAnimation(time) {
+    if (this.isClimbing) {
+      this.player.anims.stop();
+      this.player.setTexture("penitent-idle-animation", 0);
+      return;
+    }
     if (time < this.attackingUntil) {
       return;
     }
@@ -757,6 +931,11 @@ export class NaveScene extends Phaser.Scene {
 
   defeatEnemy(enemy) {
     const isBoss = enemy.kind === "boss";
+    const reward = { mourner: 35, censer: 50, boss: 500 }[enemy.kind] ?? 0;
+    this.gameState.resourceCount = Math.min(
+      HUD_SPEC.resource.digitField.max,
+      this.gameState.resourceCount + reward,
+    );
     enemy.body.enable = false;
     this.tweens.add({ targets: enemy, alpha: 0, y: enemy.y + 20, duration: isBoss ? 1100 : 380, onComplete: () => enemy.destroy() });
     if (isBoss) this.defeatBoss();
@@ -794,6 +973,7 @@ export class NaveScene extends Phaser.Scene {
     this.gameState.fervour = Math.max(0, this.gameState.fervour - 25);
     const checkpoint = this.gameState.checkpoint;
     this.projectiles.clear(true, true);
+    this.stopClimbing();
     this.player.body.enable = true;
     this.player.body.reset(checkpoint.x, checkpoint.y);
     this.player.setAlpha(1).clearTint();
@@ -806,7 +986,7 @@ export class NaveScene extends Phaser.Scene {
     this.invulnerableUntil = this.time.now + 1200;
 
     if (this.gameState.bossAwake && this.boss?.active) {
-      this.boss.body.reset(4860, 360);
+      this.boss.body.reset(5060, 360);
       this.boss.setVelocity(0, 0).setAlpha(1).clearTint();
       this.boss.attackingUntil = 0;
       this.boss.nextAttackAt = this.time.now + 1400;
@@ -831,7 +1011,7 @@ export class NaveScene extends Phaser.Scene {
     this.gameState.relicActivated = true;
     this.gameState.checkpoint = { ...CHECKPOINT_POSITION };
     this.gameState.health = this.gameState.maxHealth;
-    this.relic.body.enable = false;
+    this.relicTrigger.body.enable = false;
     this.relic.setTint(0xffd679);
     this.tweens.add({ targets: this.relic, y: this.relic.y - 6, duration: 700, yoyo: true, repeat: -1 });
     this.flash(0xd0a54e, 250);
@@ -855,7 +1035,7 @@ export class NaveScene extends Phaser.Scene {
         this.bossGate.body.enable = true;
       },
     });
-    const boss = this.spawnEnemy("boss", 4860, 360, 14, 4500, 5260);
+    const boss = this.spawnEnemy("boss", 5060, 360, 14, 4500, 5260);
     boss.maxHp = 14;
     boss.nextAttackAt = this.time.now + 1400;
     this.boss = boss;
@@ -890,9 +1070,33 @@ export class NaveScene extends Phaser.Scene {
 
   updateHud() {
     this.healthPips.forEach((pip, index) => {
-      pip.setFillStyle(index < this.gameState.health ? 0x9d2923 : 0x332522, index < this.gameState.health ? 1 : 0.6);
+      pip.setTexture(index < this.gameState.health ? "hud-health-pip-full" : "hud-health-pip-empty");
     });
-    this.fervourBar.displayWidth = 155 * (this.gameState.fervour / 100);
+    const fervourWidth = Math.floor(
+      HUD_SPEC.status.fervourFill.width * Phaser.Math.Clamp(this.gameState.fervour, 0, 100) / 100,
+    );
+    this.fervourBar.setVisible(fervourWidth > 0);
+    if (fervourWidth > 0) this.fervourBar.setCrop(0, 0, fervourWidth, HUD_SPEC.status.fervourFill.height);
+
+    const charges = Phaser.Math.Clamp(this.gameState.itemCharges, 0, this.gameState.maxItemCharges);
+    this.itemSlots.forEach((slot, index) => {
+      slot.setTexture(index < charges ? "hud-vial-full" : "hud-vial-empty");
+    });
+
+    const field = HUD_SPEC.resource.digitField;
+    const resourceValue = Math.floor(Phaser.Math.Clamp(this.gameState.resourceCount, 0, field.max));
+    if (resourceValue !== this.lastRenderedResourceCount) {
+      const glyphs = String(resourceValue);
+      this.resourceDigits.forEach((digit) => digit.setVisible(false).setTexture("hud-digit-blank"));
+      const startX = field.right - field.glyphWidth - (glyphs.length - 1) * field.advance;
+      glyphs.split("").forEach((glyph, index) => {
+        this.resourceDigits[index]
+          .setPosition(startX + index * field.advance, field.y)
+          .setTexture(`hud-digit-${glyph}`)
+          .setVisible(true);
+      });
+      this.lastRenderedResourceCount = resourceValue;
+    }
   }
 
   bloodBurst(x, y) {
